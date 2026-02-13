@@ -1,0 +1,125 @@
+import pandas as pd
+import numpy as np
+import ast
+import gc
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import roc_auc_score, log_loss
+
+# Only install these if they aren't already in your Colab environment
+# !pip install catboost lightgbm xgboost -q
+
+import lightgbm as lgb
+import xgboost as xgb
+from catboost import CatBoostClassifier
+
+# 1. Load Data
+train = pd.read_csv('Train (9).csv')
+test = pd.read_csv('Test (8).csv')
+ss = pd.read_csv('SampleSubmission (9).csv')
+
+def preprocess_ultimate(df):
+    df = df.copy()
+    
+    # --- Date Features ---
+    df['training_day'] = pd.to_datetime(df['training_day'])
+    df['month'] = df['training_day'].dt.month
+    df['day_of_year'] = df['training_day'].dt.dayofyear
+    df['week_of_year'] = df['training_day'].dt.isocalendar().week.astype(int)
+    df['day_of_week'] = df['training_day'].dt.dayofweek
+    
+    # --- Topic Engineering ---
+    def parse_topics(x):
+        try:
+            items = ast.literal_eval(x)
+            return [t.strip().lower() for sub in items for t in sub]
+        except: return []
+    
+    df['parsed_topics'] = df['topics_list'].apply(parse_topics)
+    df['num_topics'] = df['parsed_topics'].apply(len)
+    df['unique_topics_count'] = df['parsed_topics'].apply(lambda x: len(set(x)))
+    
+    # Check for keywords in topics
+    keywords = ['poultry', 'dairy', 'maize', 'feeding', 'health', 'finance', 'housing']
+    for kw in keywords:
+        df[f'has_{kw}'] = df['parsed_topics'].apply(lambda x: 1 if any(kw in t for t in x) else 0)
+    
+    # --- Categorical Interactions ---
+    # Combining Trainer and Ward often captures specific local success rates
+    df['trainer_ward'] = df['trainer'].astype(str) + "_" + df['ward'].astype(str)
+    
+    # Frequency Encoding
+    cat_cols = ['gender', 'registration', 'age', 'county', 'subcounty', 'ward', 'trainer', 'trainer_ward']
+    for col in cat_cols:
+        df[f'{col}_freq'] = df[col].map(df[col].value_counts(normalize=True))
+        le = LabelEncoder()
+        df[col] = le.fit_transform(df[col].astype(str))
+        
+    return df
+
+# Initial Processing
+train_df = preprocess_ultimate(train)
+test_df = preprocess_ultimate(test)
+
+targets = ['adopted_within_07_days', 'adopted_within_90_days', 'adopted_within_120_days']
+features = [c for c in train_df.columns if c not in targets + ['ID', 'farmer_name', 'training_day', 'topics_list', 'parsed_topics', 'group_name']]
+
+# 2. Modeling Strategy: Triple Ensemble
+def train_and_predict(target_col):
+    print(f"\n{'='*30}\nTarget: {target_col}\n{'='*30}")
+    
+    X = train_df[features]
+    y = train_df[target_col]
+    X_test = test_df[features]
+    
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    
+    lgb_preds, xgb_preds, cat_preds = [], [], []
+    
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+        
+        # --- LightGBM ---
+        m_lgb = lgb.LGBMClassifier(n_estimators=2000, learning_rate=0.01, colsample_bytree=0.8, 
+                                   subsample=0.8, objective='binary', metric='auc', importance_type='gain', 
+                                   random_state=42, verbose=-1)
+        m_lgb.fit(X_train, y_train, eval_set=[(X_val, y_val)], callbacks=[lgb.early_stopping(100)])
+        lgb_preds.append(m_lgb.predict_proba(X_test)[:, 1])
+        
+        # --- XGBoost ---
+        m_xgb = xgb.XGBClassifier(n_estimators=2000, learning_rate=0.01, max_depth=6, 
+                                  subsample=0.8, colsample_bytree=0.8, objective='binary:logistic', 
+                                  eval_metric='auc', random_state=42, tree_method='hist')
+        m_xgb.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False, early_stopping_rounds=100)
+        xgb_preds.append(m_xgb.predict_proba(X_test)[:, 1])
+        
+        # --- CatBoost ---
+        m_cat = CatBoostClassifier(iterations=2000, learning_rate=0.01, depth=6, eval_metric='AUC',
+                                   random_seed=42, verbose=False, early_stopping_rounds=100)
+        m_cat.fit(X_train, y_train, eval_set=(X_val, y_val))
+        cat_preds.append(m_cat.predict_proba(X_test)[:, 1])
+        
+        print(f"Fold {fold+1} complete.")
+
+    # Average the folds and then blend the models
+    avg_lgb = np.mean(lgb_preds, axis=0)
+    avg_xgb = np.mean(xgb_preds, axis=0)
+    avg_cat = np.mean(cat_preds, axis=0)
+    
+    # 40% CatBoost, 30% LightGBM, 30% XGBoost blend
+    return (0.4 * avg_cat) + (0.3 * avg_lgb) + (0.3 * avg_xgb)
+
+# 3. Execution
+final_submission = pd.DataFrame({'ID': test['ID']})
+
+for target in targets:
+    probs = train_and_predict(target)
+    prefix = target.replace('adopted_within_', 'Target_').replace('_days', '')
+    final_submission[f'{prefix}_AUC'] = probs
+    final_submission[f'{prefix}_LogLoss'] = probs
+
+# Final check and save
+final_submission = final_submission[ss.columns]
+final_submission.to_csv('ultimate_ensemble_submission.csv', index=False)
+print("\n[SUCCESS] Ultimate ensemble submission generated!")
